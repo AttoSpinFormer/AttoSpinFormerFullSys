@@ -1,0 +1,397 @@
+`include "constants.vams"
+`include "disciplines.vams"
+
+//------------------------------------------------------------------------------
+//Related Paper:	 AttoSpinFormer: An Energy-efficient Magneto Electric Spin Orbit Logic-based Compute-in-Memory Transformer Architecture
+// MESO2YA: Magnetoelectric Spin–Orbit (MESO) device compact behavioral model
+//
+// Ports:
+//   in   : ME input voltage
+//   out  : ISOC output node (Norton current source || R_isoc)
+//   vdd  : supply
+//   gate : gate control (LOW enables)
+//   gnd  : ground
+//------------------------------------------------------------------------------
+
+module MESO2YA(in, out, vdd, gate, gnd);
+  inout in, out, vdd, gate, gnd;
+  electrical in, out, vdd, gate, gnd;
+
+  // Internal state nodes:
+  //   V(nQ)  = qhat = Q_FE / Q_scale  (dimensionless)
+  //   V(nmx) = m_x_raw (dimensionless)
+  //   V(nmy) = m_y_raw (dimensionless)
+  //   V(nmz) = m_z_raw (dimensionless)
+  electrical nQ, nmx, nmy, nmz;
+
+  // -----------------------------
+  // Physical constants
+  // -----------------------------
+  parameter real EPS0 = 8.854187817e-12;      // F/m
+  parameter real MU0  = 4.0*`M_PI*1e-7;       // H/m
+  parameter real KB   = 1.380649e-23;         // J/K
+
+  // -----------------------------
+  // Geometry / material parameters
+  // -----------------------------
+  parameter real A_me   = 1.07e-15;            // m^2
+  parameter real t_me   = 5e-9;               // m
+
+  // Multiferroic parameters
+  parameter real eps_mf = 54.0;               // relative permittivity
+  parameter real P_mf   = 0.3;              // C/m^2 (remanent polarization)
+  parameter real E_mf   = 1.8e6;              // V/m (switching E-field)
+  parameter real B_mf   = 0.03;               // Tesla (exchange bias at E_mf)
+
+  // ME field model selector:
+  // 0: use applied field E_app = Vin/t_me (field-driven)
+  // 1: use (P - P_mf)/(eps0*eps_mf)
+  // 2: use P/(eps0*eps_mf)
+  parameter integer me_field_model = 0;
+  parameter real E_clip = 0.0;                // V/m (0 disables)
+
+  // -----------------------------
+  // Landau-Khalatnikov (LK) dynamics
+  //   dQ/dt = (A_me/rho0) * (E_app - (2a1P + 4a11P^3 + 6a111P^5))
+  // -----------------------------
+  parameter real rho0   = 1000.0;
+  parameter real a1     = -1.48e8;
+  parameter real a11    = -3.06e7;
+  parameter real a111   =  2.48e8;
+
+  // Charge scaling (Coulombs). Choose so qhat = Q/Q_scale is O(1..1e3).
+  parameter real Q_scale = 1.0e-19 from (0:inf);
+
+  // -----------------------------
+  // Nanomagnet parameters
+  // -----------------------------
+  parameter real Ms     = 8.0e5;              // A/m
+  parameter real Ku     = 6.0e5;              // J/m^3
+  parameter real alpha  = 0.01;               // Gilbert damping
+  parameter real gamma  = 1.76e11;            // rad/(s*T)
+
+  // Magnet dimensions
+  parameter real w_m    = 2.0e-8;             // m
+  parameter real l_m    = 2.0e-8;             // m
+  parameter real t_fm   = 2.0e-9;             // m
+
+  // Demagnetization factors (sum ~ 1)
+  parameter real N_x    = 0.05;
+  parameter real N_y    = 0.05;
+  parameter real N_z    = 0.90;
+
+  // -----------------------------
+  // Spin–orbit conversion
+  // -----------------------------
+  parameter real P_fm        = 0.7;
+  parameter real lambda_IREE = 1.4e-8;        // m
+  parameter real theta_SHE   = 0.5;
+  parameter real lambda_sf   = 3.0e-9;        // m
+  parameter real t_soc       = 4.0e-9;        // m
+  parameter real R_isoc      = 4.0e3;         // Ohm
+
+  // -----------------------------
+  // Supply/access path
+  // -----------------------------
+  parameter real r_fm       = 3.0e-14;        // Ohm*m^2
+  parameter real Rs         = 4.0e3;          // Ohm
+  parameter real Lr         = 1.48e-4;        // Ohm*m
+  parameter real W_x        = 2.0e-9;         // m
+
+  // Gate control: gate LOW enables
+  parameter real Vgate_th     = 0.5;          // V
+  parameter real Vgate_smooth = 1e-3;         // V
+
+  // -----------------------------
+  // Numerical helpers / DC paths
+  // -----------------------------
+  // Weak DC paths to avoid singular matrices and to bias DCOP toward IC targets.
+  parameter real Rleak_state = 1.0e90;        // Ohm
+  parameter real Rleak_Q     = 1.0e90;        // Ohm
+  parameter integer leak_to_ic = 1;           // 1: leak-to-IC target, 0: leak-to-0
+
+  // ODE stamping scale (arbitrary but must be >0)
+  parameter real C_state = 1.0e-15 from (0:inf);
+
+  // Optional soft constraint to keep |m_raw| ~ 1
+  parameter real k_norm = 5e11;               // 1/s (0 disables)
+
+  // Safe epsilons
+  parameter real tiny   = 1.0e-30;
+  parameter real m_eps  = 1.0e-30;
+
+  // -----------------------------
+  // Initial-condition targets (used by leak-to-IC)
+  // -----------------------------
+  parameter real Q_init  = 0.0;               // C (0 => use A_me*P_mf)
+  parameter real mx_init = 0.0;
+  parameter real my_init = 1.0;
+  parameter real mz_init = 0.0;
+
+  // Debug print
+  parameter integer debug = 1;
+
+  // -----------------------------
+  // STT helper constants
+  // -----------------------------
+  parameter real hbar        = 1.0545718e-34;
+  parameter real elem_charge = 1.60217663e-19;
+  parameter real V_mag       = 5e-25;
+
+parameter real m_floor  = 1.0e-9 from (0:inf);
+parameter real k_reseed = 1.0e12;
+parameter integer preserve_my_sign = 1; 
+
+
+  // -----------------------------
+  // Internal reals
+  // -----------------------------
+  real qhat, qhat_target;
+  real Qfe, Q_target;
+
+  real mx_raw, my_raw, mz_raw;
+  real mx, my, mz;
+  real m2_raw, m_norm;
+
+  real P, P2, P3, P5;
+  real E_LK, E_app, dQ_dt;
+
+  real E_r, B_me, H_me;
+
+  real Hk;
+  real H_ani_x, H_ani_y, H_ani_z;
+  real H_demag_x, H_demag_y, H_demag_z;
+  real H_eff_x, H_eff_y, H_eff_z;
+
+  real mxH_x, mxH_y, mxH_z;
+  real mDotH;
+  real mxmH_x, mxmH_y, mxmH_z;
+  real pref;
+  real dmx_dt, dmy_dt, dmz_dt;
+  real err;
+
+  real vg, sw;
+  real R_on, R_fm, R_sum;
+  real I_drive;
+
+  real lambda_isoc;
+  real I_s, I_isoc;
+
+  // Spin torque intermediates
+  real T_scale;
+  real Is_x, Is_y, Is_z;
+  real m_dot_Is;
+  real torque_x, torque_y, torque_z;
+  real m_x_torque_x, m_x_torque_y, m_x_torque_z;
+  real add_x, add_y, add_z;
+
+   real m_floor2, my_dir;
+  // Input "dielectric" capacitance
+  real M1;
+
+  analog begin
+
+    // ------------------------------------------------------------
+    // IC targets (as physical charge in Coulombs)
+    // ------------------------------------------------------------
+    if (Q_init == 0.0) begin
+      Q_target = A_me * P_mf;
+    end else begin
+      Q_target = Q_init;
+    end
+    qhat_target = Q_target / (Q_scale + tiny);
+
+    // ------------------------------------------------------------
+    // Weak DC bias paths (to avoid DCOP singularities)
+    // ------------------------------------------------------------
+    if (leak_to_ic != 0) begin
+      I(nQ,  gnd) <+ (V(nQ,  gnd) - qhat_target) / (Rleak_Q     + tiny);
+      I(nmx, gnd) <+ (V(nmx, gnd) - mx_init)    / (Rleak_state + tiny);
+      I(nmy, gnd) <+ (V(nmy, gnd) - my_init)    / (Rleak_state + tiny);
+      I(nmz, gnd) <+ (V(nmz, gnd) - mz_init)    / (Rleak_state + tiny);
+    end else begin
+      I(nQ,  gnd) <+  V(nQ,  gnd) / (Rleak_Q     + tiny);
+      I(nmx, gnd) <+  V(nmx, gnd) / (Rleak_state + tiny);
+      I(nmy, gnd) <+  V(nmy, gnd) / (Rleak_state + tiny);
+      I(nmz, gnd) <+  V(nmz, gnd) / (Rleak_state + tiny);
+    end
+
+    // ------------------------------------------------------------
+    // Read / scale states
+    // ------------------------------------------------------------
+    qhat   = V(nQ, gnd);
+    Qfe    = Q_scale * qhat;
+
+    mx_raw = V(nmx, gnd);
+    my_raw = V(nmy, gnd);
+    mz_raw = V(nmz, gnd);
+
+    // Normalize magnetization for physics computations
+    m2_raw = mx_raw*mx_raw + my_raw*my_raw + mz_raw*mz_raw;
+    m_norm=sqrt(m2_raw+m_eps);
+    m_floor2 = m_floor*m_floor;
+
+    mx = mx_raw / m_norm;
+    my = my_raw / m_norm;
+    mz = mz_raw / m_norm;
+
+    //my=my_dir>0?1:-1;
+
+    if (debug != 0) begin
+      $display("MESO2Y:", " t=", $abstime,
+               " qhat=", qhat, " Q(C)=", Qfe,
+               " m_raw=(", mx_raw, ",", my_raw, ",", mz_raw, ")",
+               " |m_raw|=", m_norm,
+               " m=(", mx, ",", my, ",", mz, ")");
+    end
+
+    // ------------------------------------------------------------
+    // Ferroelectric LK dynamics
+    // ------------------------------------------------------------
+    P  = Qfe / (A_me + tiny);
+    P2 = P*P;
+    P3 = P2*P;
+    P5 = P3*P2;
+
+    E_LK  = (2.0*a1)*P + (4.0*a11)*P3 + (6.0*a111)*P5;
+    E_app = V(in, gnd) / (t_me + tiny);
+
+    dQ_dt = (A_me / (rho0 + tiny)) * (E_app - E_LK);
+
+    // ODE on qhat: dqhat/dt = (1/Q_scale) * dQ/dt
+    I(nQ, gnd) <+  C_state * ddt(V(nQ, gnd));
+    I(nQ, gnd) <+ -C_state * (dQ_dt / (Q_scale + tiny));
+
+    // Terminal current into ME:
+    // I = C_me*dVin/dt + dQfe/dt, where Qfe = Q_scale*qhat
+    M1 = (A_me * EPS0 * eps_mf) / (t_me + tiny);
+    I(in, gnd) <+ M1 * ddt(V(in, gnd));
+    I(in, gnd) <+ Q_scale * ddt(V(nQ, gnd));
+
+    // ------------------------------------------------------------
+    // Magnetoelectric effective field
+    // ------------------------------------------------------------
+    if (me_field_model == 0) begin
+      E_r = E_app ;
+    end else if (me_field_model == 1) begin
+      E_r = (P - P_mf) / (EPS0*eps_mf + tiny);
+    end else begin
+      E_r = (P) / (EPS0*eps_mf + tiny);
+    end
+
+    if (E_clip > 0.0) begin
+      if (E_r >  E_clip) E_r =  E_clip;
+      if (E_r < -E_clip) E_r = -E_clip;
+    end
+
+    B_me = (B_mf / (E_mf + tiny)) * E_r;
+    H_me = B_me / (MU0 + tiny);
+
+    // ------------------------------------------------------------
+    // Supply/access current
+    // ------------------------------------------------------------
+    vg = V(gate, gnd);
+    sw = 0.5 * (1.0 - tanh( (vg - Vgate_th) / (Vgate_smooth + tiny) ));
+
+    R_on  = Lr  / (W_x + tiny);
+    R_fm  = r_fm / (A_me + tiny);
+    R_sum = Rs + R_on + R_fm;
+
+    I_drive = sw * V(vdd, gnd) / (R_sum + tiny);
+    I(vdd, gnd) <+ I_drive;
+
+    // ------------------------------------------------------------
+    // Nanomagnet effective field
+    // ------------------------------------------------------------
+    Hk = (2.0*Ku) / (MU0*Ms + tiny);
+
+    H_ani_x = 0.0;
+    H_ani_y = Hk * my;                // easy axis along y
+    H_ani_z = 0.0;
+
+    H_demag_x = -Ms * N_x * mx;
+    H_demag_y = -Ms * N_y * my;
+    H_demag_z = -Ms * N_z * mz;
+
+    H_eff_x = H_demag_x + H_ani_x;
+    H_eff_y = H_demag_y + H_ani_y + H_me;
+    H_eff_z = H_demag_z + H_ani_z;
+
+    // ------------------------------------------------------------
+    // LLG dynamics
+    // dm/dt = -(gamma*MU0/(1+alpha^2)) [ m×H + alpha*m×(m×H) ]
+    // ------------------------------------------------------------
+    mxH_x = (my*H_eff_z - mz*H_eff_y);
+    mxH_y = (mz*H_eff_x - mx*H_eff_z);
+    mxH_z = (mx*H_eff_y - my*H_eff_x);
+
+    mDotH = mx*H_eff_x + my*H_eff_y + mz*H_eff_z;
+
+    // m × (m × H) = m(m·H) - H   (valid for unit m)
+    mxmH_x = mx*mDotH - H_eff_x;
+    mxmH_y = my*mDotH - H_eff_y;
+    mxmH_z = mz*mDotH - H_eff_z;
+
+    pref = -(gamma*MU0) / (1.0 + alpha*alpha);
+
+    // NOTE: damping sign is "+" in this expanded form
+    dmx_dt = pref*( mxH_x + alpha*mxmH_x );
+    dmy_dt = pref*( mxH_y + alpha*mxmH_y );
+    dmz_dt = pref*( mxH_z + alpha*mxmH_z );
+
+    // Optional soft normalization to keep |m_raw| ~ 1
+    if (k_norm != 0.0) begin
+      err = 1.0 - m2_raw;
+      dmx_dt = dmx_dt + k_norm*err*mx;
+      dmy_dt = dmy_dt + k_norm*err*my;
+      dmz_dt = dmz_dt + k_norm*err*mz;
+    end
+
+    // ------------------------------------------------------------
+    // Simple STT-like torque term
+    // ------------------------------------------------------------
+    Is_x = 0.0;
+    Is_y = theta_SHE * I_drive;
+    Is_z = 0.0;
+
+    T_scale = (gamma*hbar) / (2.0*elem_charge*Ms*V_mag + tiny);
+
+    m_dot_Is = (mx*Is_x + my*Is_y + mz*Is_z);
+    torque_x = T_scale * (Is_x - m_dot_Is*mx);
+    torque_y = T_scale * (Is_y - m_dot_Is*my);
+    torque_z = T_scale * (Is_z - m_dot_Is*mz);
+
+    m_x_torque_x = (my*torque_z - mz*torque_y);
+    m_x_torque_y = (mz*torque_x - mx*torque_z);
+    m_x_torque_z = (mx*torque_y - my*torque_x);
+
+    add_x = (torque_x - alpha*m_x_torque_x) / (1.0 + alpha*alpha);
+    add_y = (torque_y - alpha*m_x_torque_y) / (1.0 + alpha*alpha);
+    add_z = (torque_z - alpha*m_x_torque_z) / (1.0 + alpha*alpha);
+
+    dmx_dt = dmx_dt + add_x;
+    dmy_dt = dmy_dt + add_y;
+    dmz_dt = dmz_dt + add_z;
+
+    // Integrate raw magnetization components
+    I(nmx, gnd) <+  C_state * ddt(V(nmx, gnd));
+    I(nmx, gnd) <+ -C_state * dmx_dt;
+
+    I(nmy, gnd) <+  C_state * ddt(V(nmy, gnd));
+    I(nmy, gnd) <+ -C_state * dmy_dt;
+
+    I(nmz, gnd) <+  C_state * ddt(V(nmz, gnd));
+    I(nmz, gnd) <+ -C_state * dmz_dt;
+
+    // ------------------------------------------------------------
+    // ISOC output current (Norton equivalent at OUT)
+    // ------------------------------------------------------------
+    lambda_isoc = lambda_IREE + theta_SHE*lambda_sf*tanh( t_soc/(2.0*lambda_sf + tiny) );
+    I_s    = P_fm * I_drive;
+    I_isoc = (lambda_isoc / (w_m + tiny)) * I_s * my;
+
+    I(out, gnd) <+ -I_isoc;
+    I(out, gnd) <+  V(out, gnd) / (R_isoc + tiny);
+
+  end
+endmodule
