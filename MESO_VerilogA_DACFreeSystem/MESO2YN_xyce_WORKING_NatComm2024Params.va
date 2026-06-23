@@ -1,0 +1,164 @@
+`include "disciplines.vams"
+`include "constants.vams"
+
+module MESO2YP(out, in, vdd, gate, gnd);
+  inout out, in, vdd, gate, gnd;
+  electrical out, in, vdd, gate, gnd;
+
+electrical nQ;
+
+  parameter real MU0      = 4.0*`M_PI*1e-7;      // H/m
+  parameter real EPS0     = 8.854187817e-12;     // F/m
+  parameter real tiny     = 1e-30;
+  parameter real eps_mf   = 54.0;
+  parameter real t_me     = 30e-9;                // m
+  parameter real w_m      = 150e-9;               // m (magnet width)
+  parameter real l_m      = 500e-9;               // m (magnet length)
+  parameter real A_me     = 7.5e-14;                 // m^2 (0 => w_m*l_m)
+  parameter real E_mf     = 1.8e6;               // V/m
+  parameter real B_mf     = 0.03;                // Tesla at E_mf (exchange-bias equivalent)
+  parameter real B_clamp  = 5.0;                 // Tesla (numerical clamp for very large pulses)
+
+  parameter real R_leak_me = 1e12;               // Ohm (very weak leakage)
+
+  parameter real my_init   = -1.0;                // initial state (+1 or -1)
+  parameter real tau_mag   = 5e-11;              // s (magnet switching relaxation time)
+  parameter real B_c       = 0.3056;                // Tesla (hysteresis / coercive strength)
+  parameter real B_slope   = 0.02;               // Tesla (smoothness of tanh transition)
+
+  parameter real C_state   = 1e-15;              // A*s (acts like a "capacitance" for the state)
+
+  parameter real R_ic      = 1e4;                // Ohm (with C_state gives ~ps time constant)
+  parameter real tau_ic    = 5e-12;              // s (decay time of the initialization helper)
+
+  parameter real lambda_isoc = 1.4e-8;           // m
+  parameter real eta_spindir = 0.1;              // spin polarization efficiency (0..1)
+  parameter real R_shunt     = 5e3;              // Ohm (sets supply current draw)
+  parameter real R_isoc      = 3.214285714;              // Ohm (ISOC internal resistance, parallel)
+
+  parameter integer gateActiveLow = 1;
+  parameter real vth_gate   = 0.3;               // V
+  parameter real vgate_slope= 0.01;              // V (smoothness)
+
+  parameter integer debug = 0;
+
+  parameter real Q_scale = 1.0e-19 from (0:inf);
+    parameter real Rleak_Q=1e25;
+    parameter real leak_to_ic=1;
+    parameter real Q_init=0;
+    parameter real P_mf=0.6;
+parameter real rho0   = 1000.0;
+  parameter real a1     = -1.48e8;
+  parameter real a11    = -3.06e7;
+  parameter real a111   =  2.48e8;
+
+    real Aeff;
+    real C_me;
+    real Q_target;
+    real qhat_target;
+    real qhat;
+    real Qfe;
+    real P,P2,P3,P5;
+    real E_LK,E_app;
+    real dQ_dt;
+    real Er, B_me, B_lin;
+    real vg, sw;
+    real my, my_tgt, dmy_dt;
+    real I_vdd, I_s, I_out, gain_isoc;
+
+
+  electrical nmy;
+
+  analog begin
+
+    Aeff = (A_me > 0.0) ? A_me : (w_m * l_m);
+    C_me = EPS0 * eps_mf * Aeff / (t_me + tiny);
+
+    if (Q_init == 0.0) begin
+      Q_target = A_me * P_mf;
+    end else begin
+      Q_target = Q_init;
+    end
+    qhat_target = Q_target / (Q_scale + tiny);
+
+    if (leak_to_ic != 0) begin
+      I(nQ,  gnd) <+ (V(nQ,  gnd) - qhat_target) / (Rleak_Q     + tiny);
+      I(nmy, gnd) <+ (V(nmy,  gnd) - my_init) / (Rleak_Q     + tiny);
+    end else begin
+      I(nQ,  gnd) <+  V(nQ,  gnd) / (Rleak_Q     + tiny);
+      I(nmy, gnd) <+ V(nmy,  gnd) / (Rleak_Q     + tiny);
+    end
+
+    qhat   = V(nQ, gnd);
+    Qfe    = Q_scale * qhat;
+
+
+
+    vg = V(gate, gnd);
+
+    if (gateActiveLow != 0) begin
+      sw = 0.5*(1.0 - tanh((vg - vth_gate)/(vgate_slope + tiny)));
+    end else begin
+      sw = 0.5*(1.0 + tanh((vg - vth_gate)/(vgate_slope + tiny)));
+    end
+
+	P  = Qfe / (Aeff + tiny);
+	P2 = P*P;
+	P3 = P2*P;
+    P5 = P3*P2;
+
+    E_LK  = (2.0*a1)*P + (4.0*a11)*P3 + (6.0*a111)*P5;
+    E_app = V(in, gnd) / (t_me + tiny);
+
+    dQ_dt = (Aeff / (rho0 + tiny)) * (E_app - E_LK);
+
+    I(nQ, gnd) <+  C_state * ddt(V(nQ, gnd));
+    I(nQ, gnd) <+ -C_state * (dQ_dt / (Q_scale + tiny));
+
+
+    I(in, gnd) <+ C_me * ddt(V(in, gnd));
+    I(in, gnd) <+ Q_scale * ddt(V(nQ, gnd));
+
+    Er   = V(in, gnd) / (t_me + tiny);           // V/m
+    B_lin= (B_mf/(E_mf + tiny)) * Er;            // Tesla (linear scaling)
+
+      if (B_lin < -B_clamp) B_me = -B_clamp;
+      else if (B_lin > B_clamp) B_me = B_clamp;
+      else B_me = B_lin;
+
+    my = V(nmy, gnd);
+
+    //This file doesnt use LLG equations
+    //LLG equations are inherently unstable
+    //So, for circuit simulations and in-memory compute tests, 
+    //we replaced the LLG equations with the following circuit-accurate equations 
+    //Reference the paper - where these equations are taken from. 
+    my_tgt = tanh( (B_me + B_c*my) / (B_slope + tiny) );
+
+    dmy_dt = (my_tgt - my) / (tau_mag + tiny);
+
+    I(nmy, gnd) <+ C_state * ddt(V(nmy, gnd));
+    I(nmy, gnd) <+ -C_state * dmy_dt;
+
+    I(nmy, gnd) <+ (V(nmy, gnd) - my_init) / (R_ic + tiny) * exp(-$abstime/(tau_ic + tiny));
+
+    I_vdd = sw * V(vdd, gnd) / (R_shunt + tiny);
+    I(vdd, gnd) <+ I_vdd;
+
+    I_s = eta_spindir * I_vdd;
+
+    gain_isoc = lambda_isoc / (w_m + tiny);
+
+    I_out = gain_isoc * I_s * my;
+
+    I(out, gnd) <+ I_out;
+    I(out, gnd) <+ V(out, gnd) / (R_isoc + tiny);
+
+    
+    if (debug != 0) begin
+      $strobe("%m: t=%g  Vin=%g  Er=%g  B_me=%g  my=%g  sw=%g  I_vdd=%g  I_out=%g  Vout=%g",
+              $abstime, V(in,gnd), Er, B_me, my, sw, I_vdd, I_out, V(out,gnd));
+    end
+
+  end
+endmodule
